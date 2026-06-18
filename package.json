@@ -1,0 +1,29 @@
+{
+  "name": "ai-medical-education-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Full-stack monorepo for an AI Medical Education Platform",
+  "packageManager": "pnpm@9.7.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "db:generate": "pnpm --filter @med/api db:generate",
+    "db:migrate": "pnpm --filter @med/api db:migrate",
+    "db:seed": "pnpm --filter @med/api db:seed"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "turbo": "^2.0.14",
+    "typescript": "^5.5.4"
+  }
+}

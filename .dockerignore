@@ -1,0 +1,15 @@
+# Keep build contexts lean and reproducible — deps are installed fresh in-image.
+**/node_modules
+**/.next
+**/dist
+**/.turbo
+**/*.tsbuildinfo
+**/coverage
+.git
+.gitignore
+**/.env
+**/.env.*
+!**/.env.example
+backups
+uploads
+*.md

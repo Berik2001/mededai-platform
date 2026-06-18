@@ -1,0 +1,526 @@
+// PostgreSQL schema (relational core: users, sessions, progress, audit).
+// Clinical case content lives in MongoDB (see src/cases/schemas/case.schema.ts).
+
+generator client {
+  provider = "prisma-client-js"
+  // native = local dev; the linux-musl targets cover the Alpine Docker image
+  // (arm64 + amd64) so the query engine is present at runtime in the container.
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "linux-musl-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  TEACHER
+  STUDENT
+  EXAMINER
+}
+
+enum Specialty {
+  THERAPY
+  SURGERY
+  CARDIOLOGY
+  NEUROLOGY
+  PEDIATRICS
+  CRITICAL_CARE
+  NURSING
+}
+
+enum CaseDifficulty {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+}
+
+enum CaseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum QuestionType {
+  SINGLE_CHOICE
+  MULTIPLE_CHOICE
+  IMAGE_DIAGNOSIS
+  ECG_INTERPRETATION
+  RADIOLOGY
+  CASE_BASED
+}
+
+enum TestSessionStatus {
+  IN_PROGRESS
+  SUBMITTED
+  EXPIRED
+}
+
+enum AssignmentTargetType {
+  CASE
+  TEST
+}
+
+enum SubmissionStatus {
+  ASSIGNED
+  IN_PROGRESS
+  SUBMITTED
+  GRADED
+}
+
+enum NotificationType {
+  ASSIGNMENT_CREATED
+  DEADLINE_APPROACHING
+  SUBMISSION_RECEIVED
+  SUBMISSION_GRADED
+}
+
+enum OsceSessionStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum OsceStationState {
+  PENDING
+  ACTIVE
+  DONE
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         Role     @default(STUDENT)
+  institution  String?
+  yearOfStudy  Int?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  progress      CaseProgress[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+  clinicalCases ClinicalCase[]
+  questions     Question[]
+  tests         Test[]
+  testSessions  TestSession[]
+  groupsOwned      Group[]        @relation("GroupOwner")
+  groupMemberships GroupMember[]
+  assignments      Assignment[]   @relation("AssignmentTeacher")
+  submissions      Submission[]   @relation("SubmissionStudent")
+  notifications    Notification[]
+  osceExams         OsceExam[]    @relation("OsceAuthor")
+  osceAsStudent     OsceSession[] @relation("OsceStudent")
+  osceAsExaminer    OsceSession[] @relation("OsceExaminer")
+
+  @@map("users")
+}
+
+/// A teacher-owned cohort of students.
+model Group {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner   User          @relation("GroupOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members GroupMember[]
+
+  @@index([ownerId])
+  @@map("groups")
+}
+
+model GroupMember {
+  id      String @id @default(cuid())
+  groupId String
+  userId  String
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@map("group_members")
+}
+
+/// A task assigned by a teacher, targeting a Clinical Case or a Test.
+model Assignment {
+  id           String               @id @default(cuid())
+  teacherId    String
+  title        String
+  instructions String?
+  targetType   AssignmentTargetType
+  caseId       String? // ClinicalCase.id when targetType = CASE
+  testId       String? // Test.id when targetType = TEST
+  dueAt        DateTime
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  teacher     User         @relation("AssignmentTeacher", fields: [teacherId], references: [id], onDelete: Cascade)
+  submissions Submission[]
+
+  @@index([teacherId])
+  @@map("assignments")
+}
+
+/// One row per assigned student — the recipient record and the result holder.
+model Submission {
+  id                 String           @id @default(cuid())
+  assignmentId       String
+  studentId          String
+  status             SubmissionStatus @default(ASSIGNED)
+  resultRef          String? // VP session id or TestSession id
+  score              Int? // percent achieved
+  submittedAt        DateTime?
+  grade              Int? // teacher's grade (0–100)
+  feedback           String? // teacher comment
+  reviewedAt         DateTime?
+  deadlineNotifiedAt DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  assignment Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  student    User       @relation("SubmissionStudent", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([assignmentId, studentId])
+  @@index([studentId])
+  @@map("submissions")
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  title     String
+  body      String?
+  link      String?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@map("notifications")
+}
+
+/// Question bank (relational). One unified shape covers all question types;
+/// `correctOptions` holds the index/indices of the correct option(s).
+model Question {
+  id            String         @id @default(cuid())
+  authorId      String
+  type          QuestionType
+  specialty     Specialty
+  difficulty    CaseDifficulty
+  status        CaseStatus     @default(DRAFT)
+  stem          String
+  caseVignette  String?
+  options       String[]       @default([])
+  correctOptions Int[]         @default([])
+  imageUrls     String[]       @default([])
+  explanation   String?
+  points        Int            @default(1)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  author    User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  testLinks TestQuestion[]
+
+  @@index([type])
+  @@index([specialty])
+  @@index([status])
+  @@index([authorId])
+  @@map("questions")
+}
+
+model Test {
+  id               String         @id @default(cuid())
+  authorId         String
+  title            String
+  description      String?
+  specialty        Specialty
+  difficulty       CaseDifficulty
+  status           CaseStatus     @default(DRAFT)
+  timeLimitMinutes Int            @default(20)
+  passingScore     Int            @default(60)
+  shuffle          Boolean        @default(false)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  author    User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  questions TestQuestion[]
+  sessions  TestSession[]
+
+  @@index([specialty])
+  @@index([status])
+  @@index([authorId])
+  @@map("tests")
+}
+
+/// Ordered membership of questions in a test (reusable across tests).
+model TestQuestion {
+  id         String @id @default(cuid())
+  testId     String
+  questionId String
+  order      Int
+
+  test     Test     @relation(fields: [testId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([testId, order])
+  @@unique([testId, questionId])
+  @@index([testId])
+  @@map("test_questions")
+}
+
+model TestSession {
+  id            String            @id @default(cuid())
+  testId        String
+  userId        String
+  status        TestSessionStatus @default(IN_PROGRESS)
+  /// { [questionId]: number[] } — selected option indices
+  answers       Json              @default("{}")
+  /// Question ids in the (possibly shuffled) order shown to this student
+  questionOrder String[]          @default([])
+  score         Int?
+  maxScore      Int?
+  passed        Boolean?
+  startedAt     DateTime          @default(now())
+  expiresAt     DateTime
+  submittedAt   DateTime?
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([testId])
+  @@map("test_sessions")
+}
+
+/// Clinical case METADATA (relational). The flexible content lives in MongoDB
+/// (collection `case_contents`); `contentId` is a cross-store reference.
+model ClinicalCase {
+  id               String         @id @default(cuid())
+  authorId         String
+  title            String
+  specialty        Specialty
+  difficulty       CaseDifficulty
+  status           CaseStatus     @default(DRAFT)
+  summary          String?
+  estimatedMinutes Int?
+  tags             String[]       @default([])
+  contentId        String         @unique
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  author User @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([specialty])
+  @@index([status])
+  @@index([authorId])
+  @@map("clinical_cases")
+}
+
+/// Hashed refresh tokens — enables rotation, revocation and reuse-detection.
+/// The raw token is never stored; only its SHA-256 hash.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/// Append-only audit trail of authenticated/anonymous requests.
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  method     String?
+  path       String?
+  statusCode Int?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+enum ProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+/// Tracks a learner's progress through a clinical case.
+/// `caseId` references a document in MongoDB (cross-store reference, not a FK).
+model CaseProgress {
+  id          String         @id @default(cuid())
+  userId      String
+  caseId      String
+  status      ProgressStatus @default(IN_PROGRESS)
+  score       Int? // 0–100, last AI-evaluated score
+  attempts    Int            @default(0)
+  completedAt DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, caseId])
+  @@index([userId])
+  @@map("case_progress")
+}
+
+// ─── OSCE (Objective Structured Clinical Examination) ───
+// An exam is a blueprint of timed stations, each scored against a checklist.
+// A session is one run: an examiner observes a student station-by-station.
+
+/// OSCE exam blueprint (a circuit of stations) authored by a teacher.
+model OsceExam {
+  id          String     @id @default(cuid())
+  authorId    String
+  title       String
+  description String?
+  specialty   Specialty
+  status      CaseStatus @default(DRAFT)
+  passScore   Int        @default(60) // pass threshold (percent)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  author   User          @relation("OsceAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  stations OsceStation[]
+  sessions OsceSession[]
+
+  @@index([specialty])
+  @@index([status])
+  @@index([authorId])
+  @@map("osce_exams")
+}
+
+/// A single timed station within an exam. Student-facing `scenario`; the
+/// `expected*`/`examinerBrief` fields are the hidden ground truth.
+model OsceStation {
+  id                String  @id @default(cuid())
+  examId            String
+  order             Int
+  title             String
+  scenario          String // student-facing task brief
+  durationSec       Int     @default(300)
+  expectedDiagnosis String? // hidden
+  correctPathway    String? // hidden — the correct clinical pathway
+  examinerBrief     String? // hidden — instructions/notes for the examiner
+
+  exam          OsceExam            @relation(fields: [examId], references: [id], onDelete: Cascade)
+  checklist     OsceChecklistItem[]
+  stationScores OsceStationScore[]
+
+  @@unique([examId, order])
+  @@index([examId])
+  @@map("osce_stations")
+}
+
+/// A scored checklist item the examiner ticks while observing the station.
+model OsceChecklistItem {
+  id        String  @id @default(cuid())
+  stationId String
+  order     Int
+  label     String
+  points    Int     @default(1)
+  critical  Boolean @default(false) // missing a critical item fails the station
+  category  String?
+
+  station OsceStation       @relation(fields: [stationId], references: [id], onDelete: Cascade)
+  results OsceCheckResult[]
+
+  @@unique([stationId, order])
+  @@index([stationId])
+  @@map("osce_checklist_items")
+}
+
+/// One run of an exam: a student observed by an examiner.
+model OsceSession {
+  id          String            @id @default(cuid())
+  examId      String
+  studentId   String
+  examinerId  String
+  status      OsceSessionStatus @default(SCHEDULED)
+  selfConduct Boolean           @default(false) // student drives the exam themselves (AI patient + auto-grade)
+  totalScore  Int               @default(0)
+  maxScore    Int               @default(0)
+  percent     Int               @default(0)
+  debrief     Json? // OsceDebrief, generated at completion
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  exam          OsceExam           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  student       User               @relation("OsceStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  examiner      User               @relation("OsceExaminer", fields: [examinerId], references: [id], onDelete: Cascade)
+  stationScores OsceStationScore[]
+
+  @@index([examId])
+  @@index([studentId])
+  @@index([examinerId])
+  @@map("osce_sessions")
+}
+
+/// Per-station scoring within a session (materialized when the session starts).
+model OsceStationScore {
+  id              String           @id @default(cuid())
+  sessionId       String
+  stationId       String
+  state           OsceStationState @default(PENDING)
+  startedAt       DateTime?
+  endedAt         DateTime?
+  score           Int              @default(0)
+  maxScore        Int              @default(0)
+  criticalFailed  Boolean          @default(false)
+  examinerComment String?
+  aiAnalysis      Json?
+  chat            Json? // OsceChatMessage[] — student↔AI-patient dialogue in self-conduct mode
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  session      OsceSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  station      OsceStation       @relation(fields: [stationId], references: [id], onDelete: Cascade)
+  checkResults OsceCheckResult[]
+
+  @@unique([sessionId, stationId])
+  @@index([sessionId])
+  @@map("osce_station_scores")
+}
+
+/// The examiner's tick (or not) of a single checklist item in a session.
+model OsceCheckResult {
+  id              String  @id @default(cuid())
+  stationScoreId  String
+  checklistItemId String
+  checked         Boolean @default(false)
+  note            String?
+
+  stationScore  OsceStationScore  @relation(fields: [stationScoreId], references: [id], onDelete: Cascade)
+  checklistItem OsceChecklistItem @relation(fields: [checklistItemId], references: [id], onDelete: Cascade)
+
+  @@unique([stationScoreId, checklistItemId])
+  @@index([stationScoreId])
+  @@map("osce_check_results")
+}
